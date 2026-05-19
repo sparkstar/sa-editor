@@ -104,6 +104,11 @@
     button:disabled { opacity: 0.5; cursor: default; }
 
     .primary-btn { background: #2d5f8f; border-color: rgba(149, 197, 255, 0.4); }
+    .danger-btn {
+      background: rgba(166, 48, 64, 0.85);
+      border-color: rgba(255, 143, 143, 0.58);
+      color: #fff4f4;
+    }
 
     .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 
@@ -222,6 +227,7 @@
     .record-head { display: flex; gap: 8px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
     .record-id { font-family: var(--mono); font-size: 14px; }
     .selected-record-line { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 2px; }
+    .record-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
 
     .meta-box {
       border: var(--border-soft); border-radius: 8px; padding: 8px;
@@ -337,20 +343,25 @@
       display: flex;
       gap: 6px;
       flex-wrap: wrap;
+      align-items: center;
     }
+    .preview-lang-label { color: var(--fg1); font-size: 12px; margin-right: 2px; }
     .preview-lang-btn {
-      padding: 3px 10px;
-      font-size: 12px;
+      padding: 6px 12px;
+      font-size: 13px;
+      font-weight: 700;
       line-height: 1.2;
-      min-height: 24px;
-      border-radius: 999px;
-      background: rgba(255, 255, 255, 0.05);
+      min-height: 32px;
+      min-width: 48px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.045);
       color: var(--fg1);
     }
     .preview-lang-btn.active {
       color: var(--fg0);
-      background: rgba(127, 178, 240, 0.22);
-      border-color: rgba(127, 178, 240, 0.55);
+      background: rgba(45, 95, 143, 0.85);
+      border-color: rgba(149, 197, 255, 0.68);
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
     }
     .preview-card .canvas-wrap { min-height: 106px; padding: 6px; }
     .preview-card canvas { margin: 0 auto; }
@@ -411,6 +422,7 @@
             <label>Export
               <button id="downloadJsonBtn" class="primary-btn" type="button" disabled>Export</button>
             </label>
+            <button id="revertAllBtn" class="danger-btn" type="button" disabled>Revert all</button>
           </div>
           <div id="jsonStatus" class="toolbar" style="margin-top:10px">
             <span class="pill">Rows: 0</span>
@@ -449,6 +461,9 @@
                   <input id="unusedToggle" type="checkbox" disabled>
                   Unused
                 </label>
+              </div>
+              <div class="record-actions">
+                <button id="revertRecordBtn" type="button" disabled>Revert record</button>
               </div>
             </div>
             <div id="recordMeta" class="meta-grid"></div>
@@ -973,10 +988,10 @@
           </section>`;
       }).join("");
 
-      els.previewLangSelector.innerHTML = EDIT_LANGS.map((lang) => {
+      els.previewLangSelector.innerHTML = `<span class="preview-lang-label">Toggle language</span>${EDIT_LANGS.map((lang) => {
         const { label } = LANG_VIEW[lang];
         return `<button class="preview-lang-btn" type="button" aria-pressed="false" data-lang="${lang}">${label}</button>`;
-      }).join("");
+      }).join("")}`;
       applyLangVisibility();
 
       const missingOpts = LANGUAGE_PLUGINS.map((p) =>
@@ -1492,10 +1507,12 @@
       if (!state.doc) {
         els.dirtyStatus.textContent = "No JSON loaded";
         els.dirtyStatus.className = "pill";
+        if (els.revertAllBtn) els.revertAllBtn.disabled = true;
         return;
       }
       els.dirtyStatus.textContent = dirtyCount > 0 ? `${dirtyCount} modified` : "Loaded";
       els.dirtyStatus.className = dirtyCount > 0 ? "pill ok" : "pill";
+      if (els.revertAllBtn) els.revertAllBtn.disabled = dirtyCount === 0;
     }
 
     function renderJsonStatus() {
@@ -1606,6 +1623,47 @@
       for (const key of Object.keys(state.draftDiff || {})) {
         if (Object.keys(state.draftDiff[key] || {}).length > 0) state.dirtyKeys.add(key);
       }
+    }
+
+    function restoreRowFromOriginal(row, index) {
+      const original = state.originalRowsByKey.get(rowKey(row, index));
+      if (!row || !original) return false;
+      for (const field of EDIT_LANGS) row[field] = textOrEmpty(original[field]);
+      row.unused = original.unused === true;
+      updateDraftForRow(row, index);
+      return true;
+    }
+
+    function refreshAfterRevert() {
+      buildSearchIndex();
+      refreshSearch();
+      renderJsonStatus();
+      renderRecordDetails();
+      renderRecordList();
+      render();
+      scheduleDraftSave();
+    }
+
+    function revertCurrentRecord() {
+      const row = currentRow();
+      if (!row) return;
+      commitCurrentEdit();
+      if (!state.dirtyKeys.has(rowKey(row, state.selectedIndex))) return;
+      state.draftSaveSuppressed = false;
+      if (restoreRowFromOriginal(row, state.selectedIndex)) refreshAfterRevert();
+    }
+
+    function revertAllChanges() {
+      if (!state.doc) return;
+      commitCurrentEdit();
+      if (state.dirtyKeys.size === 0) return;
+      const count = state.dirtyKeys.size;
+      const ok = window.confirm(`Revert all ${count} modified record(s)? This will discard every unsaved edit in the current JSON and clear the saved draft.`);
+      if (!ok) return;
+      state.draftSaveSuppressed = false;
+      state.rows.forEach((row, index) => restoreRowFromOriginal(row, index));
+      syncDirtyKeysFromDiff();
+      refreshAfterRevert();
     }
 
     function scheduleDraftSave() {
@@ -1828,6 +1886,7 @@
         els.jpOriginalHex.innerHTML = '<span class="small">-</span>';
         els.unusedToggle.checked = false;
         els.unusedToggle.disabled = true;
+        els.revertRecordBtn.disabled = true;
         for (const lang of EDIT_LANGS) {
           const cfg = LANG_VIEW[lang];
           els[cfg.sourceEl].value = "";
@@ -1842,6 +1901,7 @@
       els.jpOriginalHex.innerHTML = renderHexBytes(row.jp_original_hex);
       els.unusedToggle.checked = isUnusedRow(row);
       els.unusedToggle.disabled = false;
+      els.revertRecordBtn.disabled = !state.dirtyKeys.has(rowKey(row, state.selectedIndex));
       for (const lang of EDIT_LANGS) {
         els[LANG_VIEW[lang].sourceEl].value = sourceToEditorText(row[lang]);
       }
@@ -1862,6 +1922,7 @@
       if (!changed) return;
       state.draftSaveSuppressed = false;
       updateDraftForRow(row, state.selectedIndex);
+      els.revertRecordBtn.disabled = !state.dirtyKeys.has(rowKey(row, state.selectedIndex));
       renderJsonStatus();
       scheduleSearchRefresh();
       scheduleDraftSave();
@@ -2276,6 +2337,8 @@
       for (const id of ["downloadJsonBtn", "searchInput", "filterSelect", "clearSearchBtn", "randomRecordBtn"]) {
         els[id].disabled = true;
       }
+      els.revertAllBtn.disabled = true;
+      els.revertRecordBtn.disabled = true;
       els.unusedToggle.checked = false;
       els.unusedToggle.disabled = true;
       setEditorEnabled(false);
@@ -3899,6 +3962,8 @@
       });
 
       els.downloadJsonBtn.addEventListener("click", downloadEditedJson);
+      els.revertRecordBtn.addEventListener("click", revertCurrentRecord);
+      els.revertAllBtn.addEventListener("click", revertAllChanges);
       els.restoreDraftBtn.addEventListener("click", restoreAvailableDraft);
       els.deleteDraftBtn.addEventListener("click", deleteSavedDraft);
       els.clearLoadedDataBtn.addEventListener("click", () => { void clearLoadedData(); });
