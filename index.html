@@ -378,7 +378,7 @@
       <div class="record-head">
         <div>
           <h1>SA2 Translation JSON Editor</h1>
-          <div class="sub">Upload a text_translation_tasks JSON, edit rows in memory, then download the modified JSON.</div>
+          <div class="sub">Load a branch JSON or upload a text_translation_tasks JSON, edit rows in memory, then download the modified JSON.</div>
         </div>
         <div class="title-actions">
           <button id="helpBtn" class="utility-btn" type="button">Help</button>
@@ -392,12 +392,24 @@
       <aside class="side-stack">
         <section class="panel">
           <div class="grid stack">
-            <label>Translation JSON
+            <label>Local file
               <input id="jsonFile" type="file" accept="application/json,.json">
               <div id="loadedJsonName" class="loaded-json-name">No JSON loaded</div>
             </label>
-            <label>Download
-              <button id="downloadJsonBtn" class="primary-btn" type="button" disabled>Download edited JSON</button>
+            <label>Repository branch
+              <select id="branchSelect" disabled>
+                <option value="">Loading branches...</option>
+              </select>
+            </label>
+            <div class="toolbar">
+              <button id="loadBranchBtn" type="button" disabled>Load branch</button>
+              <button id="reloadBranchesBtn" type="button" disabled>Refresh branches</button>
+              <button id="openSourceFileBtn" type="button" disabled>Open source file</button>
+              <button id="clearLoadedDataBtn" type="button" disabled hidden>Clear loaded data</button>
+              <span id="branchStatus" class="pill">Source: none</span>
+            </div>
+            <label>Export
+              <button id="downloadJsonBtn" class="primary-btn" type="button" disabled>Export</button>
             </label>
           </div>
           <div id="jsonStatus" class="toolbar" style="margin-top:10px">
@@ -572,6 +584,18 @@
 };
   </script>
   <script>
+    window.__sa2FuseModule = { exports: {} };
+    window.module = window.__sa2FuseModule;
+    window.exports = window.__sa2FuseModule.exports;
+  </script>
+  <script src="vendor/fuse.min.js"></script>
+  <script>
+    window.Fuse = window.__sa2FuseModule && window.__sa2FuseModule.exports;
+    delete window.module;
+    delete window.exports;
+    delete window.__sa2FuseModule;
+  </script>
+  <script>
     const ROM_HALF_FONT_BASE = 0x0b4100;
     const RESOURCE_TABLE_BASE = 0x68000;
     const RESOURCE_ENTRY_SIZE = 4;
@@ -581,10 +605,37 @@
     const GLYPH_H = 16;
     const GLYPH_COUNT = 0x100;
     const GLYPH_BYTES = GLYPH_H * GLYPH_COUNT;
-    const DEFAULT_HALF_GLYPH_SHEET = "images/font_half_8x16_default.png";
-    const DEFAULT_KANJI_GLYPH_SHEET = "images/font_kanji_16x16_default.png";
-    const DEFAULT_KR_ASCII_GLYPH_SHEET = "images/font_kr_ascii_f2_12px.png";
-    const DEFAULT_KR_HANGUL_GLYPH_SHEET = "images/font_kr_hangul_12px.png";
+    const GITHUB_OWNER = "ojdcorps";
+    const GITHUB_REPO = "surgingaura-utility";
+    const DEFAULT_DATA_BRANCH = "master";
+    const TRANSLATION_JSON_REPO_PATH = "vwf_viewer/data/text_translation_tasks.full.v6.json";
+    const TRANSLATION_JSON_FILE_NAME = "text_translation_tasks.full.v6.json";
+    const BRANCH_MANIFEST_CANDIDATES = [
+      "data/branches.json",
+      "branches.json",
+    ];
+    const DEFAULT_TRANSLATION_JSON_CANDIDATES = [
+      "data/text_translation_tasks.full.v6.json",
+      "text_translation_tasks.full.v6.json",
+    ];
+    const GITHUB_BRANCHES_API_URL = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/branches?per_page=100`;
+    const FUSE_SEARCH_OPTIONS = {
+      includeScore: true,
+      ignoreLocation: true,
+      threshold: 0.36,
+      distance: 1000,
+      minMatchCharLength: 1,
+      keys: [
+        { name: "searchAddress", weight: 0.7 },
+        { name: "searchOriginal", weight: 0.9 },
+        { name: "searchTranslations", weight: 0.95 },
+        { name: "searchSource", weight: 0.35 },
+        { name: "searchNotes", weight: 0.25 },
+        { name: "searchStatus", weight: 0.2 },
+        { name: "searchOrdinal", weight: 0.15 },
+        { name: "haystack", weight: 0.15 },
+      ],
+    };
 
     const TEXTWINDOW_PNG_B64 = {
       "7e0": "iVBORw0KGgoAAAANSUhEUgAAABgAAAAYBAMAAAASWSDLAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAAElBMVEVtbW22bQBtSAD/2iRtJNr////IjFvCAAAAAWJLR0QF+G/pxwAAAAd0SU1FB+oCDgcoClnT5yYAAABmSURBVBjTtY7REcAgCEPTbgAs4NUJrCuw/0wl2OPsAM2H5zOGAAilMHXHManREmzQmbpArlB/IQ53U7tFCiSSBadsDiKJ/BLiUwKbCj4OmxLYzgtdxF4JzHHpVs4a785cleaA/+ABZwMxNFcGTlEAAAAldEVYdGRhdGU6Y3JlYXRlADIwMjYtMDItMTRUMDc6NDA6MTArMDA6MDBYTsgDAAAAJXRFWHRkYXRlOm1vZGlmeQAyMDI2LTAyLTE0VDA3OjQwOjEwKzAwOjAwKRNwvwAAAABJRU5ErkJggg==",
@@ -812,7 +863,13 @@
       doc: null,
       rows: [],
       rowEntries: [],
+      searchFuse: null,
       sourceFileName: "",
+      sourceMode: "none",
+      sourceBranch: "",
+      sourceUrl: "",
+      branchItems: [],
+      loadingBranches: false,
       originalJsonText: "",
       originalHash: "",
       originalRowsByKey: new Map(),
@@ -1345,41 +1402,54 @@
       return state.rows[state.selectedIndex];
     }
 
+    function buildFuseSearch(entries) {
+      if (typeof window.Fuse !== "function") throw new Error("Fuse.js is required for search");
+      return new window.Fuse(entries, FUSE_SEARCH_OPTIONS);
+    }
+
     function buildSearchIndex() {
       state.rowEntries = state.rows.map((row, index) => {
-        const fields = [
-          index + 1,
-          row.text_addr,
-          row.end_addr,
-          row.jp_original,
-          ...EDIT_LANGS.map((l) => row[l]),
-          row.translation_status,
-          row.translator_notes,
-          row.source,
-        ].map(textOrEmpty);
+        const ordinal = textOrEmpty(index + 1);
+        const address = [row.text_addr, row.end_addr].map(textOrEmpty).filter(Boolean).join(" ");
+        const original = textOrEmpty(row.jp_original);
+        const translations = EDIT_LANGS.map((l) => row[l]).map(textOrEmpty).join("\n");
+        const status = textOrEmpty(row.translation_status);
+        const notes = textOrEmpty(row.translator_notes);
+        const source = textOrEmpty(row.source);
+        const fields = [ordinal, address, original, translations, status, notes, source];
         return {
           row,
           index,
           key: rowKey(row, index),
           haystack: normalizeSearchText(fields.join("\n")),
+          searchOrdinal: normalizeSearchText(ordinal),
+          searchAddress: normalizeSearchText(address),
+          searchOriginal: normalizeSearchText(original),
+          searchTranslations: normalizeSearchText(translations),
+          searchStatus: normalizeSearchText(status),
+          searchNotes: normalizeSearchText(notes),
+          searchSource: normalizeSearchText(source),
         };
       });
+      state.searchFuse = buildFuseSearch(state.rowEntries);
     }
 
-    function fuzzyTermScore(haystack, term) {
-      if (!term) return 0;
-      const exact = haystack.indexOf(term);
-      if (exact !== -1) return exact;
+    function normalizeAddressSearchValue(value) {
+      return normalizeSearchText(value).replace(/0x0+/g, "0x");
+    }
 
-      let from = 0;
-      let penalty = 300;
-      for (const ch of term) {
-        const found = haystack.indexOf(ch, from);
-        if (found === -1) return Infinity;
-        penalty += Math.max(0, found - from);
-        from = found + ch.length;
-      }
-      return penalty;
+    function isAddressSearchTerm(term) {
+      return /^0x[0-9a-f]+$/.test(term);
+    }
+
+    function entryMatchesAddressTerms(entry, terms) {
+      const addressTerms = terms.filter(isAddressSearchTerm);
+      if (addressTerms.length === 0) return true;
+      const address = normalizeAddressSearchValue(entry.searchAddress);
+      return addressTerms.every((term) => {
+        const normalizedTerm = normalizeAddressSearchValue(term);
+        return entry.searchAddress.includes(term) || address.includes(normalizedTerm);
+      });
     }
 
     function entryPassesFilter(entry, filter) {
@@ -1401,21 +1471,15 @@
       const terms = query.split(/\s+/).filter(Boolean);
       const out = [];
 
-      for (const entry of state.rowEntries) {
+      const candidates = query
+        ? state.searchFuse.search(query).map((match) => ({ ...match.item, score: match.score ?? 0 }))
+        : state.rowEntries;
+
+      for (const entry of candidates) {
         if (isUnusedRow(entry.row) && filter !== "unused") continue;
         if (!entryPassesFilter(entry, filter)) continue;
-        let score = entry.index;
-        if (terms.length > 0) {
-          score = 0;
-          for (const term of terms) {
-            const termScore = fuzzyTermScore(entry.haystack, term);
-            if (!Number.isFinite(termScore)) {
-              score = Infinity;
-              break;
-            }
-            score += termScore;
-          }
-        }
+        if (!entryMatchesAddressTerms(entry, terms)) continue;
+        const score = Number.isFinite(entry.score) ? entry.score : entry.index;
         if (Number.isFinite(score)) out.push({ ...entry, score });
       }
 
@@ -1442,24 +1506,30 @@
         els.loadedJsonName.classList.remove("loaded");
         renderDirtyStatus();
         renderDraftStatus();
+        updateDataSourceUi();
         return;
       }
 
       const meta = state.doc.meta || {};
       const schema = textOrEmpty(meta.schema_version) || "unknown schema";
       const file = textOrEmpty(state.sourceFileName) || "uploaded JSON";
+      const branch = textOrEmpty(state.sourceBranch);
+      const modeLabel = state.sourceMode === "upload" ? "Upload" : "File";
       els.loadedJsonName.textContent = file;
       els.loadedJsonName.classList.add("loaded");
       const unusedCount = state.rows.reduce((count, row) => count + (isUnusedRow(row) ? 1 : 0), 0);
-      els.jsonStatus.innerHTML = [
+      const items = [
         `Rows: ${state.rows.length}`,
         `Unused: ${unusedCount}`,
         `Modified: ${dirtyCount}`,
         escapeHtml(schema),
-        escapeHtml(file),
-      ].map(pill).join("");
+        `${modeLabel}: ${escapeHtml(file)}`,
+      ];
+      if (branch) items.push(`Branch: ${escapeHtml(branch)}`);
+      els.jsonStatus.innerHTML = items.map(pill).join("");
       renderDirtyStatus();
       renderDraftStatus();
+      updateDataSourceUi();
     }
 
     function renderDraftStatus() {
@@ -1568,6 +1638,9 @@
       const draft = {
         version: DRAFT_VERSION,
         sourceFileName: state.sourceFileName || "translations.json",
+        sourceMode: state.sourceMode || "none",
+        sourceBranch: state.sourceBranch || "",
+        sourceUrl: state.sourceUrl || "",
         originalHash: state.originalHash,
         originalJson: state.originalJsonText,
         schemaVersion: textOrEmpty(state.doc && state.doc.meta && state.doc.meta.schema_version),
@@ -1618,7 +1691,11 @@
 
       if (!state.doc || state.originalHash !== draft.originalHash) {
         try {
-          initializeTranslationJson(draft.originalJson, draft.sourceFileName || "restored_draft.json");
+          initializeTranslationJson(draft.originalJson, draft.sourceFileName || "restored_draft.json", {
+            mode: draft.sourceMode || "",
+            branch: draft.sourceBranch || "",
+            url: draft.sourceUrl || "",
+          });
         } catch (err) {
           for (const lang of EDIT_LANGS) renderWarnings(lang, [`Draft restore failed: ${err.message}`]);
           return;
@@ -1881,7 +1958,224 @@
       else dialog.removeAttribute("open");
     }
 
-    function initializeTranslationJson(text, sourceFileName) {
+    function encodePathSegments(value) {
+      return textOrEmpty(value).split("/").map((part) => encodeURIComponent(part)).join("/");
+    }
+
+    function githubRawUrlForBranch(branch) {
+      const ref = normalizeBranchName(branch) || DEFAULT_DATA_BRANCH;
+      return `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${encodePathSegments(ref)}/${encodePathSegments(TRANSLATION_JSON_REPO_PATH)}`;
+    }
+
+    function githubBlobUrlForBranch(branch) {
+      const ref = normalizeBranchName(branch) || DEFAULT_DATA_BRANCH;
+      return `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/blob/${encodePathSegments(ref)}/${encodePathSegments(TRANSLATION_JSON_REPO_PATH)}`;
+    }
+
+    function normalizeBranchName(value) {
+      return textOrEmpty(value).trim();
+    }
+
+    function safeBranchFileSuffix(branch) {
+      return (normalizeBranchName(branch) || "branch")
+        .replace(/[^\w.-]+/g, "_")
+        .replace(/^_+|_+$/g, "") || "branch";
+    }
+
+    function branchSourceFileName(branch) {
+      const base = TRANSLATION_JSON_FILE_NAME.replace(/\.json$/i, "");
+      return `${base}.${safeBranchFileSuffix(branch)}.json`;
+    }
+
+    function branchItemForName(branch) {
+      const name = normalizeBranchName(branch);
+      return state.branchItems.find((item) => item.name === name) || null;
+    }
+
+    function branchDataCandidates(itemOrName) {
+      const item = typeof itemOrName === "object" && itemOrName ? itemOrName : { name: itemOrName };
+      const branch = normalizeBranchName(item.name) || DEFAULT_DATA_BRANCH;
+      const explicitUrl = item.url || item.raw_url || item.download_url;
+      if (explicitUrl) return [explicitUrl];
+      if (branch === DEFAULT_DATA_BRANCH) return DEFAULT_TRANSLATION_JSON_CANDIDATES;
+      return [githubRawUrlForBranch(branch)];
+    }
+
+    function branchSourcePageUrl(branch) {
+      const item = branchItemForName(branch);
+      return (item && (item.html_url || item.source_url)) || githubBlobUrlForBranch(branch);
+    }
+
+    function setBranchStatus(message, kind = "") {
+      if (!els.branchStatus) return;
+      els.branchStatus.textContent = message;
+      els.branchStatus.className = ["pill", kind].filter(Boolean).join(" ");
+    }
+
+    function updateDataSourceUi() {
+      if (!els.jsonFile || !els.branchSelect) return;
+      const mode = state.sourceMode || "none";
+      const hasLoadedDoc = !!state.doc;
+      const hasBranches = state.branchItems.length > 0;
+      const sourceLocked = mode !== "none";
+      els.jsonFile.disabled = sourceLocked;
+      els.branchSelect.disabled = sourceLocked || state.loadingBranches || !hasBranches;
+      els.loadBranchBtn.disabled = sourceLocked || state.loadingBranches || !hasBranches || !normalizeBranchName(els.branchSelect.value);
+      els.reloadBranchesBtn.disabled = sourceLocked || state.loadingBranches;
+      els.openSourceFileBtn.disabled = mode !== "branch" || !normalizeBranchName(state.sourceBranch);
+      els.clearLoadedDataBtn.hidden = !hasLoadedDoc;
+      els.clearLoadedDataBtn.disabled = !hasLoadedDoc;
+    }
+
+    function updateOpenSourceFileButton() {
+      updateDataSourceUi();
+    }
+
+    function normalizeBranchItems(rawItems) {
+      const seen = new Map();
+      for (const raw of rawItems || []) {
+        const item = typeof raw === "string" ? { name: raw } : raw;
+        if (!item || typeof item !== "object") continue;
+        const name = normalizeBranchName(item.name || item.branch);
+        if (!name || seen.has(name)) continue;
+        seen.set(name, {
+          name,
+          url: item.url || item.raw_url || item.download_url || "",
+          html_url: item.html_url || item.source_url || "",
+          sha: textOrEmpty(item.sha || item.commit?.sha),
+        });
+      }
+      return [...seen.values()].sort((a, b) => {
+        if (a.name === DEFAULT_DATA_BRANCH) return -1;
+        if (b.name === DEFAULT_DATA_BRANCH) return 1;
+        return a.name.localeCompare(b.name);
+      });
+    }
+
+    async function fetchBranchManifestItems() {
+      let lastErr = null;
+      for (const path of BRANCH_MANIFEST_CANDIDATES) {
+        try {
+          const res = await fetch(encodeURI(path), { cache: "no-store" });
+          if (!res.ok) throw new Error(`${res.status} ${res.statusText}`.trim());
+          const manifest = await res.json();
+          const rawItems = Array.isArray(manifest) ? manifest : manifest.branches;
+          const items = normalizeBranchItems(rawItems);
+          if (items.length > 0) return { items, source: path };
+          throw new Error("manifest has no branches");
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      throw lastErr || new Error("branch manifest not found");
+    }
+
+    async function fetchGitHubBranchItems() {
+      const rawItems = [];
+      for (let page = 1; page <= 10; page += 1) {
+        const url = `${GITHUB_BRANCHES_API_URL}&page=${page}`;
+        const res = await fetch(url, {
+          cache: "no-store",
+          headers: { Accept: "application/vnd.github+json" },
+        });
+        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`.trim());
+        const data = await res.json();
+        if (!Array.isArray(data)) throw new Error("GitHub branch response is not an array");
+        rawItems.push(...data.map((item) => ({
+          name: item.name,
+          sha: item.commit && item.commit.sha,
+        })));
+        if (data.length < 100) break;
+      }
+      return normalizeBranchItems(rawItems);
+    }
+
+    function renderBranchSelect(selectedBranch) {
+      const selected = normalizeBranchName(selectedBranch) || DEFAULT_DATA_BRANCH;
+      const items = state.branchItems.length > 0 ? state.branchItems : [{ name: DEFAULT_DATA_BRANCH }];
+      els.branchSelect.innerHTML = items
+        .map((item) => `<option value="${escapeAttr(item.name)}">${escapeHtml(item.name)}</option>`)
+        .join("");
+      els.branchSelect.value = items.some((item) => item.name === selected) ? selected : items[0].name;
+      updateDataSourceUi();
+    }
+
+    async function refreshBranchList() {
+      const previous = normalizeBranchName((els.branchSelect && els.branchSelect.value) || state.sourceBranch) || DEFAULT_DATA_BRANCH;
+      state.loadingBranches = true;
+      updateDataSourceUi();
+      setBranchStatus("Source: loading branches");
+
+      try {
+        const manifest = await fetchBranchManifestItems();
+        state.branchItems = manifest.items;
+        renderBranchSelect(previous);
+        setBranchStatus(`Branches: ${state.branchItems.length} from manifest`, "ok");
+      } catch (_manifestErr) {
+        try {
+          state.branchItems = await fetchGitHubBranchItems();
+          renderBranchSelect(previous);
+          setBranchStatus(`Branches: ${state.branchItems.length} from GitHub`, "ok");
+        } catch (githubErr) {
+          state.branchItems = [{ name: DEFAULT_DATA_BRANCH, url: DEFAULT_TRANSLATION_JSON_CANDIDATES[0] }];
+          renderBranchSelect(previous);
+          setBranchStatus(`Branch list unavailable; using ${DEFAULT_DATA_BRANCH}`, "warn");
+          console.warn("Branch list load failed:", githubErr);
+        }
+      } finally {
+        state.loadingBranches = false;
+        updateDataSourceUi();
+      }
+    }
+
+    function canDiscardLoadedJson(action = "replace the loaded data") {
+      if (!state.doc) return true;
+      commitCurrentEdit();
+      if (state.dirtyKeys.size === 0) return true;
+      return window.confirm(`Current JSON has unsaved edits. ${action} without exporting discards those in-memory edits. Continue?`);
+    }
+
+    async function loadTranslationJsonFromBranch(branch) {
+      const branchName = normalizeBranchName(branch) || DEFAULT_DATA_BRANCH;
+      const item = branchItemForName(branchName) || { name: branchName };
+      const candidates = branchDataCandidates(item);
+      let lastErr = null;
+      setBranchStatus(`Loading branch: ${branchName}`);
+      for (const url of candidates) {
+        try {
+          const res = await fetch(encodeURI(url), { cache: "no-store" });
+          if (!res.ok) throw new Error(`${res.status} ${res.statusText}`.trim());
+          const text = await res.text();
+          await loadTranslationJsonText(text, branchSourceFileName(branchName), { mode: "branch", branch: branchName, url });
+          setBranchStatus(`Source: branch ${branchName}`, "ok");
+          updateOpenSourceFileButton();
+          return true;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      setBranchStatus(`Branch load failed: ${branchName}`, "warn");
+      throw lastErr || new Error(`failed to load ${branchName}`);
+    }
+
+    async function handleBranchChange() {
+      updateDataSourceUi();
+      const nextBranch = normalizeBranchName(els.branchSelect.value);
+      if (state.sourceMode === "none" && nextBranch) setBranchStatus(`Branch selected: ${nextBranch}`);
+    }
+
+    async function handleLoadBranch() {
+      const nextBranch = normalizeBranchName(els.branchSelect.value);
+      if (!nextBranch) return;
+      if (!canDiscardLoadedJson("Loading a branch")) return;
+      try {
+        await loadTranslationJsonFromBranch(nextBranch);
+      } catch (err) {
+        for (const lang of EDIT_LANGS) renderWarnings(lang, [`Branch load failed: ${err.message}`]);
+      }
+    }
+
+    function initializeTranslationJson(text, sourceFileName, sourceInfo = {}) {
       const parsed = JSON.parse(text);
       if (!parsed || !Array.isArray(parsed.rows)) {
         throw new Error("JSON must have a top-level rows array");
@@ -1891,6 +2185,11 @@
       state.doc = parsed;
       state.rows = parsed.rows;
       state.sourceFileName = sourceFileName || "translations.json";
+      state.sourceMode = sourceInfo.mode === "upload" || sourceInfo.mode === "branch"
+        ? sourceInfo.mode
+        : sourceInfo.branch ? "branch" : "upload";
+      state.sourceBranch = normalizeBranchName(sourceInfo.branch);
+      state.sourceUrl = textOrEmpty(sourceInfo.url);
       state.originalJsonText = text;
       state.originalHash = hashText(text);
       state.draftStorageKey = `${DRAFT_STORAGE_PREFIX}${state.originalHash}`;
@@ -1919,40 +2218,82 @@
       }
     }
 
-    async function loadTranslationJsonText(text, sourceName) {
+    async function loadTranslationJsonText(text, sourceName, sourceInfo = {}) {
       const storageKey = `${DRAFT_STORAGE_PREFIX}${hashText(text)}`;
       const existingDraft = await readDraft(storageKey);
-      initializeTranslationJson(text, sourceName || "translations.json");
+      initializeTranslationJson(text, sourceName || "translations.json", sourceInfo);
       if (draftHasChanges(existingDraft)) {
         setAvailableDraft(existingDraft, storageKey);
         applyDraftDiff(existingDraft);
       } else {
         setAvailableDraft(null, "");
       }
+      updateOpenSourceFileButton();
     }
 
     async function loadTranslationJsonFile(file) {
-      await loadTranslationJsonText(await file.text(), file.name);
+      await loadTranslationJsonText(await file.text(), file.name, { mode: "upload", branch: "", url: "" });
+      setBranchStatus(`Source: uploaded file ${file.name}`, "ok");
+      updateOpenSourceFileButton();
     }
 
-    const DEFAULT_TRANSLATION_JSON_CANDIDATES = [
-      "data/text_translation_tasks.full.v6.json",
-      "text_translation_tasks.full.v6.json",
-    ];
+    async function removeDraftForKey(key) {
+      if (!key) return;
+      await draftStorageRemove(key);
+      if (await draftStorageGet(DRAFT_LAST_KEY) === key) await draftStorageRemove(DRAFT_LAST_KEY);
+      if (state.availableDraftKey === key) setAvailableDraft(null, "");
+    }
 
-    async function tryAutoLoadTranslationJson() {
-      for (const path of DEFAULT_TRANSLATION_JSON_CANDIDATES) {
-        try {
-          const res = await fetch(encodeURI(path));
-          if (!res.ok) continue;
-          const text = await res.text();
-          await loadTranslationJsonText(text, path.split("/").pop());
-          return true;
-        } catch (_err) {
-          // ignore and try next
-        }
+    function resetLoadedDataState() {
+      if (state.draftSaveTimer != null) {
+        window.clearTimeout(state.draftSaveTimer);
+        state.draftSaveTimer = null;
       }
-      return false;
+      state.doc = null;
+      state.rows = [];
+      state.rowEntries = [];
+      state.searchFuse = null;
+      state.searchResults = [];
+      state.sourceFileName = "";
+      state.sourceMode = "none";
+      state.sourceBranch = "";
+      state.sourceUrl = "";
+      state.originalJsonText = "";
+      state.originalHash = "";
+      state.draftStorageKey = "";
+      state.draftDiff = {};
+      state.draftSaveSuppressed = false;
+      state.draftChangedInSession = false;
+      state.selectedIndex = -1;
+      state.dirtyKeys.clear();
+      state.issueCache.clear();
+      state.originalRowsByKey = new Map();
+      lastMetaRowKey = "__never__";
+
+      els.jsonFile.value = "";
+      els.searchInput.value = "";
+      els.filterSelect.value = "all";
+      for (const id of ["downloadJsonBtn", "searchInput", "filterSelect", "clearSearchBtn", "randomRecordBtn"]) {
+        els[id].disabled = true;
+      }
+      els.unusedToggle.checked = false;
+      els.unusedToggle.disabled = true;
+      setEditorEnabled(false);
+      setBranchStatus("Source: none");
+      renderJsonStatus();
+      renderRecordDetails();
+      renderRecordList();
+      render();
+    }
+
+    async function clearLoadedData() {
+      if (!state.doc) return;
+      if (!canDiscardLoadedJson("Clearing loaded data")) return;
+      const key = state.draftStorageKey;
+      resetLoadedDataState();
+      await removeDraftForKey(key);
+      renderDraftStatus();
+      updateDataSourceUi();
     }
 
     function downloadEditedJson() {
@@ -1962,7 +2303,6 @@
         window.clearTimeout(state.draftSaveTimer);
         state.draftSaveTimer = null;
       }
-      void saveDraftNow();
       const json = JSON.stringify(state.doc, null, 2) + "\n";
       const blob = new Blob([json], { type: "application/json;charset=utf-8" });
       const url = URL.createObjectURL(blob);
@@ -1974,6 +2314,31 @@
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
+      void markExportedJsonAsClean(json);
+    }
+
+    async function markExportedJsonAsClean(json) {
+      if (!state.doc) return;
+      const exportedDoc = state.doc;
+      const oldDraftKey = state.draftStorageKey;
+      const nextHash = hashText(json);
+      const nextDraftKey = `${DRAFT_STORAGE_PREFIX}${nextHash}`;
+      await removeDraftForKey(oldDraftKey);
+      if (nextDraftKey !== oldDraftKey) await removeDraftForKey(nextDraftKey);
+      if (state.doc !== exportedDoc) return;
+
+      state.originalJsonText = json;
+      state.originalHash = nextHash;
+      state.draftStorageKey = nextDraftKey;
+      state.draftDiff = {};
+      state.draftSaveSuppressed = false;
+      state.draftChangedInSession = false;
+      state.dirtyKeys.clear();
+      buildOriginalRowMap();
+      setAvailableDraft(null, "");
+      refreshSearch();
+      renderJsonStatus();
+      renderRecordList();
     }
 
     function insertSourceToken(tokenText, lang) {
@@ -2567,8 +2932,6 @@
 
     const GLYPH_SLOTS = {
       half: {
-        defaultUrl: DEFAULT_HALF_GLYPH_SHEET,
-        loadFromUrl: loadHalfGlyphSheetFromUrl,
         loadEmbedded() {
           const data = SA2_DEFAULT_FONT_DATA;
           const rows = decodeBase64ToU8(data?.halfRowsB64 || "");
@@ -2577,8 +2940,6 @@
         },
       },
       kanji: {
-        defaultUrl: DEFAULT_KANJI_GLYPH_SHEET,
-        loadFromUrl: loadKanjiGlyphSheetFromUrl,
         loadEmbedded() {
           const data = SA2_DEFAULT_FONT_DATA;
           const left = decodeBase64ToU8(data?.kanjiLeftRowsB64 || "");
@@ -2596,13 +2957,9 @@
         },
       },
       krAscii: {
-        defaultUrl: DEFAULT_KR_ASCII_GLYPH_SHEET,
-        loadFromUrl: loadKrAsciiGlyphSheetFromUrl,
         loadEmbedded: () => loadKrAsciiGlyphSheetFromUrl(pngDataUrl(KR_DEFAULT_FONT_DATA.asciiPngB64), "embedded:kr-f2"),
       },
       krHangul: {
-        defaultUrl: DEFAULT_KR_HANGUL_GLYPH_SHEET,
-        loadFromUrl: loadKrHangulGlyphSheetFromUrl,
         loadEmbedded: () => loadKrHangulGlyphSheetFromUrl(pngDataUrl(KR_DEFAULT_FONT_DATA.hangulPngB64), "embedded:kr-hangul"),
       },
     };
@@ -2610,13 +2967,8 @@
     async function loadGlyphSlot(slotName) {
       const slot = GLYPH_SLOTS[slotName];
       if (!slot) throw new Error(`unknown glyph slot: ${slotName}`);
-      try {
-        await slot.loadFromUrl(slot.defaultUrl, `sheet:${slot.defaultUrl}`);
-        return "png";
-      } catch (_err) {
-        await slot.loadEmbedded();
-        return "embedded";
-      }
+      await slot.loadEmbedded();
+      return "embedded";
     }
 
     function requiredGlyphSlots() {
@@ -3404,7 +3756,7 @@
     function canUseTokenShortcut() {
       if (!currentRow()) return false;
       const active = document.activeElement;
-      if (active === els.searchInput || active === els.jsonFile) return false;
+      if (active === els.searchInput || active === els.jsonFile || active === els.branchSelect) return false;
       return true;
     }
 
@@ -3456,13 +3808,20 @@
       state.doc = null;
       state.rows = [];
       state.rowEntries = [];
+      state.searchFuse = null;
       state.searchResults = [];
+      state.sourceFileName = "";
+      state.sourceMode = "none";
+      state.sourceBranch = "";
+      state.sourceUrl = "";
       state.selectedIndex = -1;
       for (const id of ["downloadJsonBtn", "searchInput", "filterSelect", "clearSearchBtn", "randomRecordBtn"]) {
         els[id].disabled = true;
       }
       els.unusedToggle.checked = false;
       els.unusedToggle.disabled = true;
+      els.jsonFile.value = "";
+      setBranchStatus(`Source load failed: ${err.message}`, "warn");
       renderJsonStatus();
       renderRecordDetails();
       renderRecordList();
@@ -3542,6 +3901,14 @@
       els.downloadJsonBtn.addEventListener("click", downloadEditedJson);
       els.restoreDraftBtn.addEventListener("click", restoreAvailableDraft);
       els.deleteDraftBtn.addEventListener("click", deleteSavedDraft);
+      els.clearLoadedDataBtn.addEventListener("click", () => { void clearLoadedData(); });
+      els.branchSelect.addEventListener("change", () => { void handleBranchChange(); });
+      els.loadBranchBtn.addEventListener("click", () => { void handleLoadBranch(); });
+      els.reloadBranchesBtn.addEventListener("click", () => { void refreshBranchList(); });
+      els.openSourceFileBtn.addEventListener("click", () => {
+        const branch = normalizeBranchName(state.sourceBranch || els.branchSelect.value);
+        if (branch) window.open(branchSourcePageUrl(branch), "_blank", "noopener");
+      });
       els.randomRecordBtn.addEventListener("click", selectRandomSearchResult);
       els.unusedToggle.addEventListener("change", bindUnusedToggle);
 
@@ -3610,6 +3977,7 @@
       bindEvents();
       await initDraftStorage();
       await loadLastDraftMetadata();
+      await refreshBranchList();
       renderJsonStatus();
       renderRecordDetails();
       renderRecordList();
@@ -3620,8 +3988,9 @@
       } catch (err) {
         setRomStatus(`Glyph: default PNG load failed (${err.message})`, false);
       }
-      try { await tryAutoLoadTranslationJson(); }
-      catch (err) { handleJsonLoadError(err); }
+      if (state.sourceMode === "none" && els.branchSelect.value) {
+        setBranchStatus(`Branch selected: ${els.branchSelect.value}`);
+      }
       render();
       refreshIssueSearch();
     }
