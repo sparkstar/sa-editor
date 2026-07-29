@@ -623,13 +623,20 @@
     const GITHUB_OWNER = "ojdcorps";
     const GITHUB_REPO = "surgingaura-utility";
     const DEFAULT_DATA_BRANCH = "master";
-    const TRANSLATION_JSON_REPO_PATH = "vwf_viewer/data/text_translation_tasks.full.v6.json";
-    const TRANSLATION_JSON_FILE_NAME = "text_translation_tasks.full.v6.json";
+    const TRANSLATION_JSON_REPO_PATHS = [
+      "vwf_viewer2/data/text_translation_tasks.full.v9.json",
+      "vwf_viewer2/data/text_translation_tasks.full.v6.json",
+      "vwf_viewer/data/text_translation_tasks.full.v6.json",
+    ];
+    const TRANSLATION_JSON_REPO_PATH = TRANSLATION_JSON_REPO_PATHS[0];
+    const TRANSLATION_JSON_FILE_NAME = "text_translation_tasks.full.v9.json";
     const BRANCH_MANIFEST_CANDIDATES = [
       "data/branches.json",
       "branches.json",
     ];
     const DEFAULT_TRANSLATION_JSON_CANDIDATES = [
+      "data/text_translation_tasks.full.v9.json",
+      "text_translation_tasks.full.v9.json",
       "data/text_translation_tasks.full.v6.json",
       "text_translation_tasks.full.v6.json",
     ];
@@ -637,9 +644,9 @@
     const FUSE_SEARCH_OPTIONS = {
       includeScore: true,
       ignoreLocation: true,
-      threshold: 0.36,
+      threshold: 0.3,
       distance: 1000,
-      minMatchCharLength: 1,
+      minMatchCharLength: 2,
       keys: [
         { name: "searchAddress", weight: 0.7 },
         { name: "searchOriginal", weight: 0.9 },
@@ -648,9 +655,27 @@
         { name: "searchNotes", weight: 0.25 },
         { name: "searchStatus", weight: 0.2 },
         { name: "searchOrdinal", weight: 0.15 },
-        { name: "haystack", weight: 0.15 },
       ],
     };
+    // Exact substring hits always outrank fuzzy hits. Lower score sorts first.
+    // Worst possible exact score is 0.25 + 0.3 = 0.55, so it stays below FUZZY_SCORE_OFFSET.
+    const EXACT_MATCH_FIELD_SCORES = [
+      ["searchTranslations", 0.00],
+      ["searchOriginal", 0.05],
+      ["searchAddress", 0.10],
+      ["searchNotes", 0.15],
+      ["searchSource", 0.20],
+      ["searchStatus", 0.20],
+      ["searchOrdinal", 0.25],
+    ];
+    const EXACT_MATCH_PRECISION_WEIGHT = 0.3;
+    const EXACT_MATCH_POSITION_SCALE = 40;
+    const FUZZY_SCORE_OFFSET = 1;
+    const FUZZY_MIN_TERM_LENGTH = 2;
+    // Fuzzy matching only widens recall, and every fuzzy hit sorts below every exact hit.
+    // Once a term has this many exact hits the fuzzy pass is pure cost, so skip it.
+    const FUZZY_SKIP_EXACT_HITS = 40;
+    const SEARCH_INPUT_DEBOUNCE_MS = 120;
 
     const TEXTWINDOW_PNG_B64 = {
       "7e0": "iVBORw0KGgoAAAANSUhEUgAAABgAAAAYBAMAAAASWSDLAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAAElBMVEVtbW22bQBtSAD/2iRtJNr////IjFvCAAAAAWJLR0QF+G/pxwAAAAd0SU1FB+oCDgcoClnT5yYAAABmSURBVBjTtY7REcAgCEPTbgAs4NUJrCuw/0wl2OPsAM2H5zOGAAilMHXHManREmzQmbpArlB/IQ53U7tFCiSSBadsDiKJ/BLiUwKbCj4OmxLYzgtdxF4JzHHpVs4a785cleaA/+ABZwMxNFcGTlEAAAAldEVYdGRhdGU6Y3JlYXRlADIwMjYtMDItMTRUMDc6NDA6MTArMDA6MDBYTsgDAAAAJXRFWHRkYXRlOm1vZGlmeQAyMDI2LTAyLTE0VDA3OjQwOjEwKzAwOjAwKRNwvwAAAABJRU5ErkJggg==",
@@ -904,6 +929,7 @@
       dirtyKeys: new Set(),
       searchResults: [],
       searchRefreshTimer: null,
+      searchInputTimer: null,
       issueCache: new Map(),
       frameImage: null,
       frameLoaded: false,
@@ -1418,7 +1444,10 @@
     }
 
     function buildFuseSearch(entries) {
-      if (typeof window.Fuse !== "function") throw new Error("Fuse.js is required for search");
+      if (typeof window.Fuse !== "function") {
+        console.warn("Fuse.js unavailable; falling back to exact substring search");
+        return null;
+      }
       return new window.Fuse(entries, FUSE_SEARCH_OPTIONS);
     }
 
@@ -1431,12 +1460,10 @@
         const status = textOrEmpty(row.translation_status);
         const notes = textOrEmpty(row.translator_notes);
         const source = textOrEmpty(row.source);
-        const fields = [ordinal, address, original, translations, status, notes, source];
         return {
           row,
           index,
           key: rowKey(row, index),
-          haystack: normalizeSearchText(fields.join("\n")),
           searchOrdinal: normalizeSearchText(ordinal),
           searchAddress: normalizeSearchText(address),
           searchOriginal: normalizeSearchText(original),
@@ -1480,22 +1507,62 @@
       return true;
     }
 
+    function exactMatchScore(entry, term) {
+      let best = Infinity;
+      for (const [field, base] of EXACT_MATCH_FIELD_SCORES) {
+        const value = textOrEmpty(entry[field]);
+        const at = value.indexOf(term);
+        if (at === -1) continue;
+        // Prefer terms that cover most of a short field and appear early in it, so an item
+        // name like "Leather Armor" outranks a sentence that merely mentions leather armor.
+        const coverage = term.length / Math.max(value.length, 1);
+        const position = Math.min(1, at / EXACT_MATCH_POSITION_SCALE);
+        const precision = 0.6 * (1 - coverage) + 0.4 * position;
+        best = Math.min(best, base + precision * EXACT_MATCH_PRECISION_WEIGHT);
+      }
+      return best;
+    }
+
+    // Score every row against one term, keyed by row index. A missing key means the term did not match.
+    function scoreEntriesForTerm(term) {
+      const scores = new Map();
+      for (const entry of state.rowEntries) {
+        const exact = exactMatchScore(entry, term);
+        if (Number.isFinite(exact)) scores.set(entry.index, exact);
+      }
+      if (state.searchFuse && term.length >= FUZZY_MIN_TERM_LENGTH && scores.size < FUZZY_SKIP_EXACT_HITS) {
+        for (const match of state.searchFuse.search(term)) {
+          const index = match.item.index;
+          if (!scores.has(index)) scores.set(index, FUZZY_SCORE_OFFSET + (match.score ?? 0));
+        }
+      }
+      return scores;
+    }
+
     function searchEntries() {
       const query = normalizeSearchText(els.searchInput.value).trim();
       const filter = els.filterSelect.value || "all";
       const terms = query.split(/\s+/).filter(Boolean);
       const out = [];
 
-      const candidates = query
-        ? state.searchFuse.search(query).map((match) => ({ ...match.item, score: match.score ?? 0 }))
-        : state.rowEntries;
+      // Every term must match (AND). Address terms are left to entryMatchesAddressTerms,
+      // which normalizes leading zeros, so they are not scored here.
+      const termScoreMaps = terms.filter((term) => !isAddressSearchTerm(term)).map(scoreEntriesForTerm);
 
-      for (const entry of candidates) {
+      for (const entry of state.rowEntries) {
         if (isUnusedRow(entry.row) && filter !== "unused") continue;
         if (!entryPassesFilter(entry, filter)) continue;
         if (!entryMatchesAddressTerms(entry, terms)) continue;
-        const score = Number.isFinite(entry.score) ? entry.score : entry.index;
-        if (Number.isFinite(score)) out.push({ ...entry, score });
+
+        let score = 0;
+        let matchesAllTerms = true;
+        for (const termScores of termScoreMaps) {
+          const termScore = termScores.get(entry.index);
+          if (termScore === undefined) { matchesAllTerms = false; break; }
+          score += termScore;
+        }
+        if (!matchesAllTerms) continue;
+        out.push({ ...entry, score: terms.length > 0 ? score : entry.index });
       }
 
       out.sort((a, b) => (a.score - b.score) || (a.index - b.index));
@@ -1830,8 +1897,21 @@
     }
 
     function refreshSearch() {
+      if (state.searchInputTimer != null) {
+        window.clearTimeout(state.searchInputTimer);
+        state.searchInputTimer = null;
+      }
       state.searchResults = searchEntries();
       renderRecordList();
+    }
+
+    function scheduleSearchInputRefresh() {
+      if (state.searchInputTimer != null) window.clearTimeout(state.searchInputTimer);
+      state.searchInputTimer = window.setTimeout(() => {
+        state.searchInputTimer = null;
+        state.searchResults = searchEntries();
+        renderRecordList();
+      }, SEARCH_INPUT_DEBOUNCE_MS);
     }
 
     function refreshIssueSearch() {
@@ -2023,9 +2103,13 @@
       return textOrEmpty(value).split("/").map((part) => encodeURIComponent(part)).join("/");
     }
 
-    function githubRawUrlForBranch(branch) {
+    function githubRawUrlForBranch(branch, repoPath = TRANSLATION_JSON_REPO_PATH) {
       const ref = normalizeBranchName(branch) || DEFAULT_DATA_BRANCH;
-      return `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${encodePathSegments(ref)}/${encodePathSegments(TRANSLATION_JSON_REPO_PATH)}`;
+      return `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${encodePathSegments(ref)}/${encodePathSegments(repoPath)}`;
+    }
+
+    function githubRawUrlsForBranch(branch) {
+      return TRANSLATION_JSON_REPO_PATHS.map((repoPath) => githubRawUrlForBranch(branch, repoPath));
     }
 
     function githubBlobUrlForBranch(branch) {
@@ -2043,8 +2127,10 @@
         .replace(/^_+|_+$/g, "") || "branch";
     }
 
-    function branchSourceFileName(branch) {
-      const base = TRANSLATION_JSON_FILE_NAME.replace(/\.json$/i, "");
+    function branchSourceFileName(branch, url) {
+      const fromUrl = textOrEmpty(url).split(/[?#]/)[0].split("/").pop();
+      const source = /\.json$/i.test(fromUrl) ? fromUrl : TRANSLATION_JSON_FILE_NAME;
+      const base = source.replace(/\.json$/i, "");
       return `${base}.${safeBranchFileSuffix(branch)}.json`;
     }
 
@@ -2059,7 +2145,7 @@
       const explicitUrl = item.url || item.raw_url || item.download_url;
       if (explicitUrl) return [explicitUrl];
       if (branch === DEFAULT_DATA_BRANCH) return DEFAULT_TRANSLATION_JSON_CANDIDATES;
-      return [githubRawUrlForBranch(branch)];
+      return githubRawUrlsForBranch(branch);
     }
 
     function branchSourcePageUrl(branch) {
@@ -2207,7 +2293,7 @@
           const res = await fetch(encodeURI(url), { cache: "no-store" });
           if (!res.ok) throw new Error(`${res.status} ${res.statusText}`.trim());
           const text = await res.text();
-          await loadTranslationJsonText(text, branchSourceFileName(branchName), { mode: "branch", branch: branchName, url });
+          await loadTranslationJsonText(text, branchSourceFileName(branchName, url), { mode: "branch", branch: branchName, url });
           setBranchStatus(`Source: branch ${branchName}`, "ok");
           updateOpenSourceFileButton();
           return true;
@@ -3977,7 +4063,7 @@
       els.randomRecordBtn.addEventListener("click", selectRandomSearchResult);
       els.unusedToggle.addEventListener("change", bindUnusedToggle);
 
-      els.searchInput.addEventListener("input", refreshSearch);
+      els.searchInput.addEventListener("input", scheduleSearchInputRefresh);
       els.filterSelect.addEventListener("change", refreshSearch);
       els.clearSearchBtn.addEventListener("click", () => {
         els.searchInput.value = "";
